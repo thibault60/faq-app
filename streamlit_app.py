@@ -1,18 +1,15 @@
 """
-Streamlit app: Local XLS → Cleaned XLS with unique FAQs
--------------------------------------------------------
+Streamlit app: Local XLS → Cleaned XLS (aucune cellule vide)
+------------------------------------------------------------
 * Upload an Excel file where columns **A‑H** = Q1…Q8 and **I‑P** = A1…A8.
-* **Rule requested**: **only duplicate cells are modified** (across the whole
-  sheet, any column/row).  Cells whose content occurs exactly once remain
-  strictly untouched.
-    * The **first encounter** of a value is kept; subsequent occurrences are
-      considered duplicates.
-* For every duplicate cleared (creating a hole) a fresh Q/A pair can be
-  generated via OpenAI (if `OPENAI_API_KEY` is provided); otherwise the cell
-  stays blank.
-* All returned data are unique.  Pairs are shuffled per row (Fisher–Yates) to
-  avoid positional bias.
-* The processed sheet is offered as a downloadable XLSX — no external storage.
+* **Rule**: every cell in the 16‑column grid must end up **non‑empty**.  We keep
+  the first occurrence of a value as‑is; any duplicate (row/col/global) is
+  replaced by **new content** so that no blanks remain.
+    * If `OPENAI_API_KEY` is provided, the app generates fresh Q/A pairs with
+      OpenAI to fill duplicates or holes.
+    * Otherwise, it synthesises fallback content guaranteed unique by row/col.
+* Pairs are then shuffled per row (Fisher–Yates) to avoid positional bias.
+* The final sheet is returned as a downloadable XLSX — no external storage.
 """
 
 from __future__ import annotations
@@ -49,7 +46,7 @@ def fisher_yates(arr: List[Tuple[str, str]]):
 
 
 def generate_openai_pairs(keyword: str, existing: List[str], n: int) -> List[Tuple[str, str]]:
-    """Return *n* brand‑new (Q, A) pairs or blank tuples if OpenAI disabled."""
+    """Return *n* brand‑new (Q, A) pairs via OpenAI or blank tuples if disabled."""
     if not OPENAI_KEY or not openai or n == 0:
         return [("", "")] * n
 
@@ -78,81 +75,94 @@ def generate_openai_pairs(keyword: str, existing: List[str], n: int) -> List[Tup
         st.warning(f"OpenAI error : {exc}")
     return [("", "")] * n
 
+
+def fallback_pair(keyword: str, counter: int) -> Tuple[str, str]:
+    """Generate a deterministic fallback pair when OpenAI not available."""
+    return (
+        f"Quelles sont les particularités du {keyword} (variante {counter}) ?",
+        f"Cette variante {counter} du {keyword} présente une approche unique répondant aux besoins spécifiques de nos clients.",
+    )
+
 ###############################################################################
 # Core processing
 ###############################################################################
 
 def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Create a new DataFrame where only duplicate cells are changed / filled."""
+    """Create a new DataFrame where duplicates are replaced; no blank cells."""
 
     if df.shape[1] != 16:
         raise ValueError("Le fichier doit contenir exactement 16 colonnes (A‑P).")
 
-    # --- 1) First pass: count frequencies (case‑insensitive) ----------------
+    # Pass 1 : comptage global (casse insensible)
     freq: dict[str, int] = {}
-    for val in df.values.flatten(order="C"):
-        if pd.isna(val) or not str(val).strip():
+    for v in df.values.flatten(order="C"):
+        if pd.isna(v) or not str(v).strip():
             continue
-        key = str(val).strip().lower()
+        key = str(v).strip().lower()
         freq[key] = freq.get(key, 0) + 1
 
-    # --- 2) Second pass: build clean DataFrame -----------------------------
-    seen_once: set[str] = set()  # records first kept occurrence
+    # Pass 2 : traitement ligne par ligne
+    seen_once: set[str] = set()
+    fallback_counter = 1  # pour générer des contenus uniques sans OpenAI
     cleaned_rows: List[List[str]] = []
 
     for idx, row in df.iterrows():
-        values = ["" if pd.isna(v) else str(v).strip() for v in row.tolist()]
-        holes: List[Tuple[int, int]] = []  # list of (question_idx, answer_idx)
+        vals = ["" if pd.isna(v) else str(v).strip() for v in row.tolist()]
+        holes: List[Tuple[int, int]] = []  # paires à remplacer (qi, ai)
 
-        # Walk through 16 columns (Q1..Q8 + A1..A8)
+        # --- repère duplicatas et marque les trous ------------------------
         for i in range(8):
             qi, ai = i, i + 8
-            q, a = values[qi], values[ai]
+            q, a = vals[qi], vals[ai]
 
-            # --- Handle Question ------------------------------------------
+            # Question
             if q:
                 kq = q.lower()
-                if freq[kq] > 1:  # duplicate somewhere
-                    if kq in seen_once:  # not the first occurrence
-                        values[qi] = ""  # clear, will be filled later
-                        holes.append((qi, ai))
-                    else:
-                        seen_once.add(kq)  # keep first occurrence untouched
+                if freq[kq] > 1 and kq in seen_once:  # duplicata non‑premier
+                    vals[qi] = ""  # vider pour remplacement
+                    holes.append((qi, ai))
+                else:
+                    seen_once.add(kq)
             else:
-                holes.append((qi, ai))  # missing Q automatically a hole
+                holes.append((qi, ai))
 
-            # --- Handle Answer -------------------------------------------
+            # Answer
             if a:
                 ka = a.lower()
-                if freq.get(ka, 0) > 1:
-                    if ka in seen_once:
-                        values[ai] = ""
-                        # ensure hole captured (if not already)
-                        if (qi, ai) not in holes:
-                            holes.append((qi, ai))
-                    else:
-                        seen_once.add(ka)
+                if freq.get(ka, 0) > 1 and ka in seen_once:
+                    vals[ai] = ""
+                    if (qi, ai) not in holes:
+                        holes.append((qi, ai))
+                else:
+                    seen_once.add(ka)
             else:
                 if (qi, ai) not in holes:
                     holes.append((qi, ai))
 
-        # --- Fill holes via OpenAI ----------------------------------------
+        # --- remplissage des trous ---------------------------------------
         if holes:
-            keyword = values[0] or f"mot‑clé {idx+1}"
-            existing_strings = [v for v in values if v]
-            new_pairs = generate_openai_pairs(keyword, existing_strings, len(holes))
+            keyword = vals[0] or f"élément {idx+1}"
+            existing_strings = [v for v in vals if v]
+            generated_pairs = generate_openai_pairs(keyword, existing_strings, len(holes))
 
-            for (qi, ai), (q_new, a_new) in zip(holes, new_pairs):
-                if q_new and a_new and q_new.lower() not in seen_once and a_new.lower() not in seen_once:
-                    values[qi], values[ai] = q_new, a_new
-                    seen_once.update({q_new.lower(), a_new.lower()})
-                # If OpenAI disabled or duplicate found, leave cells blank.
+            for (qi, ai), (q_new, a_new) in zip(holes, generated_pairs):
+                # Si OpenAI n'a rien renvoyé, fallback local unique
+                if not q_new or not a_new:
+                    q_new, a_new = fallback_pair(keyword, fallback_counter)
+                    fallback_counter += 1
 
-        # --- Shuffle pairs per row ----------------------------------------
-        pairs = list(zip(values[:8], values[8:]))
+                # garantir unicité
+                while q_new.lower() in seen_once or a_new.lower() in seen_once:
+                    q_new, a_new = fallback_pair(keyword, fallback_counter)
+                    fallback_counter += 1
+
+                vals[qi], vals[ai] = q_new, a_new
+                seen_once.update({q_new.lower(), a_new.lower()})
+
+        # --- shuffle et push ---------------------------------------------
+        pairs = list(zip(vals[:8], vals[8:]))
         fisher_yates(pairs)
-        shuffled = [x for q, a in pairs for x in (q, a)]
-        cleaned_rows.append(shuffled)
+        cleaned_rows.append([x for q, a in pairs for x in (q, a)])
 
     return pd.DataFrame(cleaned_rows, columns=df.columns)
 
@@ -160,11 +170,11 @@ def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 # Streamlit UI
 ###############################################################################
 
-st.set_page_config(page_title="Générateur FAQs anti‑doublons", page_icon="🤖")
-st.title("📥 Nettoyeur de FAQs — ne modifie que les doublons")
+st.set_page_config(page_title="FAQs sans doublon (aucune cellule vide)", page_icon="🤖")
+st.title("📥 Nettoyeur & compléteur de FAQs — zéro cellule vide")
 
 uploaded = st.file_uploader(
-    "Téléversez un Excel .xls/.xlsx (16 colonnes : A‑P)",
+    "Chargez un fichier Excel (.xls/.xlsx) de 16 colonnes (A‑P)",
     type=["xls", "xlsx"],
 )
 
@@ -172,23 +182,23 @@ if uploaded:
     try:
         raw_df = pd.read_excel(uploaded, engine="openpyxl")
     except Exception as exc:
-        st.error(f"Erreur de lecture : {exc}")
+        st.error(f"Erreur de lecture : {exc}")
         st.stop()
 
-    st.success("Fichier chargé. Voici un aperçu :")
+    st.subheader("Aperçu du fichier importé")
     st.dataframe(raw_df.head())
 
-    if st.button("🛠️ Nettoyer les doublons et télécharger"):
+    if st.button("🚀 Nettoyer, compléter et télécharger"):
         try:
             cleaned_df = process_dataframe(raw_df)
         except Exception as exc:
-            st.error(f"Erreur de traitement : {exc}")
+            st.error(f"Erreur de traitement : {exc}")
             st.stop()
 
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             cleaned_df.to_excel(writer, index=False, sheet_name="MODULES FAQs - FINAL")
-        st.success(f"✅ Traitement terminé ({cleaned_df.shape[0]} lignes). Téléchargez ci‑dessous :")
+        st.success(f"✅ Traitement terminé : {cleaned_df.shape[0]} lignes, 0 cellule vide.")
         st.download_button(
             label="📥 Télécharger le fichier nettoyé",
             data=buffer.getvalue(),
@@ -196,15 +206,15 @@ if uploaded:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 else:
-    st.info("Importez un fichier pour commencer.")
+    st.info("Importez un classeur pour commencer.")
 
 ###############################################################################
 # Footer
 ###############################################################################
 
 st.markdown(
-    "<sub>Les cellules uniques sont préservées à l'identique ; seules les "
-    "occurrences répétées sont supprimées et, si possible, remplacées par de "
-    "nouvelles FAQs générées (option OpenAI).</sub>",
+    "<sub>Les cellules uniques restent intactes ; chaque doublon est remplacé "
+    "par un contenu original (OpenAI si disponible, sinon fallback local). "
+    "Aucune cellule vide dans la sortie.</sub>",
     unsafe_allow_html=True,
 )
