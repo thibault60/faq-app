@@ -1,0 +1,29 @@
+# --- Environnements virtuels / dépendances
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+
+# --- Config Streamlit et secrets
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# --- Clés et credentials
+service_account.json
+*.key
+*.pem
+*.p12
+
+# --- Fichiers Excel d’upload temporaires
+*.xls
+*.xlsx
+
+# --- IDE / OS divers
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
