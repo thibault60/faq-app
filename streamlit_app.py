@@ -1,58 +1,43 @@
 """
-Streamlit app: FAQ Generator without duplicates
-------------------------------------------------
-This consolidated version:
-* Accepts an Excel upload (A-H questions, I-P answers)
-* Enforces global uniqueness across all Q & A values
-* Optionally uses OpenAI to fill any blanks (if present)
-* Writes the cleaned/augmented data to a Google Sheet tab
-  "MODULES FAQs - FINAL" (recreated on each run)
-* Secrets (OPENAI_API_KEY, gcp_service_account JSON, sheet_id)
-  are read from st.secrets; NEVER commit them.
+Streamlit app: Local XLS → Cleaned XLS with unique FAQs
+-------------------------------------------------------
+* Accepts an uploaded Excel file where columns A‑H contain the first 8 Questions
+  and columns I‑P contain the corresponding Answers.
+* Removes any duplicates across all Questions **and** Answers (case‑insensitive).
+* If blanks remain, can optionally call OpenAI (if `OPENAI_API_KEY` provided in
+  secrets) to generate fresh Q/A pairs.
+* Shuffles pairs per row (Fisher–Yates) to reduce positional bias.
+* Returns a new Excel file (same layout) for download — no Google Sheets or
+  Google Cloud connection required.
+* All processing happens in‑memory; nothing is written to disk on the server.
 """
+
+from __future__ import annotations
 
 import io
 import json
-from typing import List
+from typing import List, Tuple
 
-import openai
 import pandas as pd
 import streamlit as st
-from oauth2client.service_account import ServiceAccountCredentials
-import gspread
 
-# ------------------------- Page config -------------------------------------
-st.set_page_config(page_title="Générateur de FAQs", page_icon="🤖")
-st.title("📥 Import Excel ➜ FAQs sans doublon → Google Sheets")
+# Optional: only import openai if the key exists to avoid needless dependency
+try:
+    import openai  # type: ignore
 
-# ------------------------- Secrets & clients -------------------------------
-openai.api_key = st.secrets.get("OPENAI_API_KEY", "")
+    OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", "")
+    if OPENAI_KEY:
+        openai.api_key = OPENAI_KEY
+except ModuleNotFoundError:
+    openai = None  # type: ignore
+    OPENAI_KEY = ""
 
-SCOPE = ["https://www.googleapis.com/auth/spreadsheets"]
-creds_dict = st.secrets.get("gcp_service_account", {})
-if not creds_dict:
-    st.warning("Aucun compte de service GCP configuré dans les secrets.")
+###############################################################################
+# Helpers
+###############################################################################
 
-gs_client = gspread.authorize(
-    ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
-) if creds_dict else None
-
-# ------------------------- Widgets configuration ---------------------------
-sheet_id = st.text_input(
-    "ID du Google Sheet *", st.secrets.get("sheet_id", ""), help="copiez l'ID présent dans l'URL de votre feuille Google Sheets"
-)
-
-uploaded_file = st.file_uploader(
-    "Téléversez un classeur Excel (.xls / .xlsx) – colonnes A→H = Q1…Q8, I→P = A1…A8",
-    type=["xls", "xlsx"],
-)
-
-run_btn = st.button("🚀 Générer les FAQs & mettre à jour la feuille")
-
-# ------------------------- Utilitaires -------------------------------------
-
-def fisher_yates(arr: List[str]):
-    """Shuffle in‑place (uniform)"""
+def fisher_yates(arr: List[Tuple[str, str]]):
+    """In‑place uniform shuffle of list of (Q, A) tuples."""
     import random
 
     for i in range(len(arr) - 1, 0, -1):
@@ -60,125 +45,130 @@ def fisher_yates(arr: List[str]):
         arr[i], arr[j] = arr[j], arr[i]
 
 
-def generate_openai_pairs(keyword: str, existing: List[str], n: int):
-    """Call OpenAI to generate up to *n* new (Q,A) pairs avoiding *existing*"""
-    if not openai.api_key:
-        return [["", ""]] * n
+def generate_openai_pairs(keyword: str, existing: List[str], n: int) -> List[Tuple[str, str]]:
+    """Generate *n* (Q, A) pairs via OpenAI — returns empty strings if disabled."""
+    if not OPENAI_KEY or not openai:
+        return [("", "")] * n
 
     prompt = (
         f"Rédige {n} FAQ inédites (<150 car.) pour \"{keyword}\".\n"
-        f"Varie les débuts de questions (Pourquoi, Comment, En quoi…), alterne le style et évite tout doublon avec : "
-        + " | ".join(existing)
+        "Varie les débuts de questions (Pourquoi, Comment, En quoi…), alterne le style "
+        "et évite tout doublon avec : " + " | ".join(existing[:15])
     )
 
-    response = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.8,
-        presence_penalty=0.8,
-        frequency_penalty=0.5,
-        response_format={"type": "json_object"},
-    )
     try:
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.8,
+            presence_penalty=0.8,
+            frequency_penalty=0.5,
+            response_format={"type": "json_object"},
+        )
         arr = json.loads(response.choices[0].message.content)
-    except Exception:
-        return [["", ""]] * n
+        if isinstance(arr, list):
+            return [
+                (str(o.get("q", "").strip()), str(o.get("a", "").strip()))
+                for o in arr[:n]
+            ]
+    except Exception as exc:  # pragma: no cover
+        st.warning(f"OpenAI error : {exc}")
+    return [("", "")] * n
 
-    if isinstance(arr, list):
-        return [
-            [o.get("q", ""), o.get("a", "")] for o in arr[:n]
-        ]
-    return [["", ""]] * n
 
+def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a new DataFrame with duplicates removed / filled / shuffled."""
 
-def process_dataframe(df: pd.DataFrame, max_pairs: int = 8):
-    """Return cleaned data list‑of‑lists [header, *rows*] ensuring global uniqueness"""
     if df.shape[1] != 16:
         raise ValueError("Le fichier doit contenir exactement 16 colonnes (A‑P).")
 
-    header = list(df.columns)
-    data_out = [header]
-    seen = set()
+    seen: set[str] = set()
+    cleaned_rows: List[List[str]] = []
 
     for idx, row in df.iterrows():
-        values = [str(v).strip() if not pd.isna(v) else "" for v in row.tolist()]
+        # Convert to list of strings, strip spaces, replace NaN with ""
+        values = ["" if pd.isna(v) else str(v).strip() for v in row.tolist()]
 
-        # mark existing values
+        # Register existing Q & A in global set (case‑insensitive)
         for v in values:
             if v:
                 seen.add(v.lower())
 
-        # detect holes (empty questions or answers)
-        holes = [i for i, v in enumerate(values) if v == ""]
-
+        # Identify missing pairs
+        holes = [(i, i + 8) for i in range(8) if not (values[i] and values[i + 8])]
         if holes:
-            keyword = values[0] or f"mot‑clé {idx+1}"
-            existing_q = [values[i] for i in range(16) if values[i]]
-            pairs_needed = len(holes) // 2  # each pair = 2 holes (Q & A)
-            new_pairs = generate_openai_pairs(keyword, existing_q, pairs_needed)
-            pair_idx = 0
-            for i in holes:
-                if i < 8:  # question col
-                    q, a = new_pairs[pair_idx]
-                    if q and q.lower() not in seen and a and a.lower() not in seen:
-                        values[i] = q
-                        values[i + 8] = a
-                        seen.add(q.lower())
-                        seen.add(a.lower())
-                    pair_idx += 1
+            keyword = values[0] or f"mot‑clé {idx+1}"
+            existing_strings = [v for v in values if v]
+            new_pairs = generate_openai_pairs(keyword, existing_strings, len(holes))
+            for (qi, ai), (q_new, a_new) in zip(holes, new_pairs):
+                if q_new and a_new and q_new.lower() not in seen and a_new.lower() not in seen:
+                    values[qi], values[ai] = q_new, a_new
+                    seen.update({q_new.lower(), a_new.lower()})
 
-        # now enforce uniqueness per cell
-        for i in range(16):
-            v = values[i]
-            if v and list(values).count(v) > 1:
-                values[i] = ""  # clear duplicate inside the row
+        # Remove any duplicates inside the same row (unlikely but safe)
+        for i, v in enumerate(values):
+            if v and values.count(v) > 1:
+                values[i] = ""
 
-        # shuffle pairs to avoid order bias
-        q_cols = values[:8]
-        a_cols = values[8:]
-        pairs = list(zip(q_cols, a_cols))
+        # Build list of (Q, A) pairs, shuffle them, then flatten back
+        pairs = list(zip(values[:8], values[8:]))
         fisher_yates(pairs)
-        values = [x for p in pairs for x in p]
+        shuffled = [x for q, a in pairs for x in (q, a)]
+        cleaned_rows.append(shuffled)
 
-        data_out.append(values)
+    out_df = pd.DataFrame(cleaned_rows, columns=df.columns)
+    return out_df
 
-    return data_out
+###############################################################################
+# Streamlit Interface
+###############################################################################
 
+st.header("Étape 1 : Charger votre fichier Excel")
+uploaded = st.file_uploader(
+    "Choisissez un fichier .xls ou .xlsx contenant 16 colonnes (A‑P)",
+    type=["xls", "xlsx"],
+)
 
-# ------------------------- Action handler ----------------------------------
-if run_btn and uploaded_file:
+if uploaded:
     try:
-        df = pd.read_excel(uploaded_file, engine="openpyxl")
+        raw_df = pd.read_excel(uploaded, engine="openpyxl")
     except Exception as exc:
-        st.error(f"Erreur de lecture Excel : {exc}")
+        st.error(f"Erreur lors de la lecture du fichier : {exc}")
         st.stop()
 
-    try:
-        output = process_dataframe(df)
-    except Exception as exc:
-        st.error(f"Erreur de traitement : {exc}")
-        st.stop()
+    st.success("Fichier importé avec succès !")
+    st.subheader("Aperçu :")
+    st.dataframe(raw_df.head())
 
-    if not gs_client:
-        st.error("Client Google Sheets non initialisé – secrets manquants ?")
-        st.stop()
+    if st.button("🛠️ Nettoyer / compléter & télécharger"):
+        try:
+            cleaned_df = process_dataframe(raw_df)
+        except Exception as exc:
+            st.error(f"Erreur de traitement : {exc}")
+            st.stop()
 
-    try:
-        sh = gs_client.open_by_key(sheet_id)
-    except Exception as exc:
-        st.error(f"Impossible d'ouvrir le classeur : {exc}")
-        st.stop()
+        st.success(f"✅ {cleaned_df.shape[0]} lignes traitées. Téléchargez le résultat :")
 
-    # recreate destination sheet
-    try:
-        dest_ws = sh.worksheet("MODULES FAQs - FINAL")
-        sh.del_worksheet(dest_ws)
-    except Exception:
-        pass
-    dest_ws = sh.add_worksheet("MODULES FAQs - FINAL", rows=len(output), cols=16)
-
-    dest_ws.update("A1", output)
-    st.success(f"✅ {len(output)-1} lignes écrites dans MODULES FAQs - FINAL.")
-    st.balloons()
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            cleaned_df.to_excel(writer, index=False, sheet_name="MODULES FAQs - FINAL")
+        st.download_button(
+            "📥 Télécharger le fichier XLS résultant",
+            data=buffer.getvalue(),
+            file_name="MODULES_FAQs_FINAL.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 else:
-    st.info("Veuillez sélectionner un fichier Excel puis cliquer sur le bouton.")
+    st.info("Téléversez un fichier Excel pour commencer.")
+
+###############################################################################
+# Footer
+###############################################################################
+
+st.markdown(
+    "<sub>Ce service fonctionne entièrement hors connexion Google Cloud. "
+    "Si vous ajoutez votre `OPENAI_API_KEY` dans les *secrets* Streamlit, "
+    "l'application utilisera GPT‑4o‑mini pour compléter les trous ; sinon, elle "
+    "se contentera d'éliminer les doublons et de ré‑ordonner vos paires.</sub>",
+    unsafe_allow_html=True,
+)
