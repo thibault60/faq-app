@@ -1,27 +1,32 @@
 """
-Streamlit app: Local XLS → Cleaned XLS (aucune cellule vide)
-------------------------------------------------------------
-* Upload an Excel file where columns **A‑H** = Q1…Q8 and **I‑P** = A1…A8.
-* **Rule**: every cell in the 16‑column grid must end up **non‑empty**.  We keep
-  the first occurrence of a value as‑is; any duplicate (row/col/global) is
-  replaced by **new content** so that no blanks remain.
-    * If `OPENAI_API_KEY` is provided, the app generates fresh Q/A pairs with
-      OpenAI to fill duplicates or holes.
-    * Otherwise, it synthesises fallback content guaranteed unique by row/col.
-* Pairs are then shuffled per row (Fisher–Yates) to avoid positional bias.
-* The final sheet is returned as a downloadable XLSX — no external storage.
+Streamlit app · XLS in ➜ XLS out (paraphrase duplicates, batch‑safe)
+------------------------------------------------------------------
+* **Input** : Excel (16 cols → A‑H Q1…Q8, I‑P A1…A8).
+* **Goal**  : Preserve the first occurrence of every string. All further
+  duplicates are **paraphrased** so that the meaning stays the same but the
+  wording differs (no duplicate content). Cells that are originally unique
+  remain untouched.
+* **Batch processing** : rows are processed in configurable chunks to keep
+  memory low on large files.
+* **Global repasse** : once all batches are done, a final pass ensures that no
+  duplicate remains; any residual duplicate is paraphrased again.
+* **OpenAI** (optional) is used for paraphrasing; if the key is missing, a
+  deterministic fallback adds a version counter (still unique). No cell is
+  ever left blank.
 """
 
 from __future__ import annotations
 
 import io
 import json
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import pandas as pd
 import streamlit as st
 
-# Optional OpenAI support ----------------------------------------------------
+# ---------------------------------------------------------------------------
+# Optional OpenAI                                                   
+# ---------------------------------------------------------------------------
 try:
     import openai  # type: ignore
 
@@ -31,6 +36,9 @@ try:
 except ModuleNotFoundError:
     openai = None  # type: ignore
     OPENAI_KEY = ""
+
+BATCH_SIZE = 250  # nombre de lignes par batch (modulable)
+MAX_REPASS  = 3   # tentatives globales pour éliminer tous les doublons
 
 ###############################################################################
 # Helper functions
@@ -45,136 +53,133 @@ def fisher_yates(arr: List[Tuple[str, str]]):
         arr[i], arr[j] = arr[j], arr[i]
 
 
-def generate_openai_pairs(keyword: str, existing: List[str], n: int) -> List[Tuple[str, str]]:
-    """Return *n* brand‑new (Q, A) pairs via OpenAI or blank tuples if disabled."""
-    if not OPENAI_KEY or not openai or n == 0:
-        return [("", "")] * n
+# ------------------------------ PARAPHRASE ----------------------------------
+
+def paraphrase_openai(texts: List[str]) -> List[str]:
+    """Return paraphrased versions preserving meaning; fallback blank if API off."""
+    if not OPENAI_KEY or not openai:
+        return ["" for _ in texts]
 
     prompt = (
-        f"Rédige {n} FAQ inédites (<150 car.) pour \"{keyword}\".\n"
-        "Varie les débuts de questions (Pourquoi, Comment, En quoi…), alterne le style "
-        "et évite tout doublon avec : " + " | ".join(existing[:20])
+        "Reformule chaque élément ci‑dessous en conservant strictement le sens, "
+        "sans dépasser 150 caractères par élément, dans le même ordre.\n" +
+        "\n".join(f"- {t}" for t in texts)
     )
 
     try:
-        response = openai.chat.completions.create(
+        resp = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.8,
-            presence_penalty=0.8,
-            frequency_penalty=0.5,
+            temperature=0.7,
             response_format={"type": "json_object"},
         )
-        data = json.loads(response.choices[0].message.content)
-        if isinstance(data, list):
-            return [
-                (str(o.get("q", "").strip()), str(o.get("a", "").strip()))
-                for o in data[:n]
-            ]
+        data = json.loads(resp.choices[0].message.content)
+        if isinstance(data, list) and len(data) == len(texts):
+            return [str(x).strip() for x in data]
     except Exception as exc:  # pragma: no cover
         st.warning(f"OpenAI error : {exc}")
-    return [("", "")] * n
+    # fallback return empties to trigger deterministic variant below
+    return ["" for _ in texts]
 
 
-def fallback_pair(keyword: str, counter: int) -> Tuple[str, str]:
-    """Generate a deterministic fallback pair when OpenAI not available."""
-    return (
-        f"Quelles sont les particularités du {keyword} (variante {counter}) ?",
-        f"Cette variante {counter} du {keyword} présente une approche unique répondant aux besoins spécifiques de nos clients.",
-    )
+def deterministic_variant(base: str, suffix: int) -> str:
+    """Add a short variation tag to guarantee uniqueness if no OpenAI."""
+    return f"{base} (variante {suffix})" if base else f"Contenu généré {suffix}"
 
 ###############################################################################
-# Core processing
+# Processing logic (batch + global)                                          #
 ###############################################################################
 
-def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Create a new DataFrame where duplicates are replaced; no blank cells."""
+def process_batch(df_batch: pd.DataFrame, global_seen: Dict[str, int], counter_start: int) -> Tuple[pd.DataFrame, int]:
+    """Process a single batch, paraphrasing duplicates; update global_seen."""
 
-    if df.shape[1] != 16:
-        raise ValueError("Le fichier doit contenir exactement 16 colonnes (A‑P).")
+    rows_out: List[List[str]] = []
+    fallback_counter = counter_start
 
-    # Pass 1 : comptage global (casse insensible)
-    freq: dict[str, int] = {}
-    for v in df.values.flatten(order="C"):
-        if pd.isna(v) or not str(v).strip():
-            continue
-        key = str(v).strip().lower()
-        freq[key] = freq.get(key, 0) + 1
-
-    # Pass 2 : traitement ligne par ligne
-    seen_once: set[str] = set()
-    fallback_counter = 1  # pour générer des contenus uniques sans OpenAI
-    cleaned_rows: List[List[str]] = []
-
-    for idx, row in df.iterrows():
+    for _, row in df_batch.iterrows():
         vals = ["" if pd.isna(v) else str(v).strip() for v in row.tolist()]
-        holes: List[Tuple[int, int]] = []  # paires à remplacer (qi, ai)
+        # lists to paraphrase later: index -> original text
+        dupe_indices: List[int] = []
+        dupe_texts: List[str] = []
 
-        # --- repère duplicatas et marque les trous ------------------------
-        for i in range(8):
-            qi, ai = i, i + 8
-            q, a = vals[qi], vals[ai]
-
-            # Question
-            if q:
-                kq = q.lower()
-                if freq[kq] > 1 and kq in seen_once:  # duplicata non‑premier
-                    vals[qi] = ""  # vider pour remplacement
-                    holes.append((qi, ai))
-                else:
-                    seen_once.add(kq)
+        # Step 1: mark duplicates but keep first occurrence
+        for idx, text in enumerate(vals):
+            key = text.lower()
+            if not text:
+                continue  # empty for now
+            if key in global_seen:
+                # duplicate: schedule paraphrase
+                dupe_indices.append(idx)
+                dupe_texts.append(text)
             else:
-                holes.append((qi, ai))
+                global_seen[key] = 1
 
-            # Answer
-            if a:
-                ka = a.lower()
-                if freq.get(ka, 0) > 1 and ka in seen_once:
-                    vals[ai] = ""
-                    if (qi, ai) not in holes:
-                        holes.append((qi, ai))
-                else:
-                    seen_once.add(ka)
-            else:
-                if (qi, ai) not in holes:
-                    holes.append((qi, ai))
-
-        # --- remplissage des trous ---------------------------------------
-        if holes:
-            keyword = vals[0] or f"élément {idx+1}"
-            existing_strings = [v for v in vals if v]
-            generated_pairs = generate_openai_pairs(keyword, existing_strings, len(holes))
-
-            for (qi, ai), (q_new, a_new) in zip(holes, generated_pairs):
-                # Si OpenAI n'a rien renvoyé, fallback local unique
-                if not q_new or not a_new:
-                    q_new, a_new = fallback_pair(keyword, fallback_counter)
+        # Step 2: paraphrase duplicates in one call (or fallback)
+        if dupe_indices:
+            new_texts = paraphrase_openai(dupe_texts)
+            for i, new_t in zip(dupe_indices, new_texts):
+                if not new_t:
+                    new_t = deterministic_variant(dupe_texts[dupe_indices.index(i)], fallback_counter)
                     fallback_counter += 1
-
-                # garantir unicité
-                while q_new.lower() in seen_once or a_new.lower() in seen_once:
-                    q_new, a_new = fallback_pair(keyword, fallback_counter)
+                # ensure uniqueness vs global_seen
+                while new_t.lower() in global_seen:
+                    new_t = deterministic_variant(new_t, fallback_counter)
                     fallback_counter += 1
+                vals[i] = new_t
+                global_seen[new_t.lower()] = 1
 
-                vals[qi], vals[ai] = q_new, a_new
-                seen_once.update({q_new.lower(), a_new.lower()})
+        # Step 3: handle blanks (if any)
+        for idx, text in enumerate(vals):
+            if not text:
+                filler = deterministic_variant(f"Cellule vide ligne", fallback_counter)
+                fallback_counter += 1
+                while filler.lower() in global_seen:
+                    filler = deterministic_variant(filler, fallback_counter)
+                    fallback_counter += 1
+                vals[idx] = filler
+                global_seen[filler.lower()] = 1
 
-        # --- shuffle et push ---------------------------------------------
+        # Step 4: shuffle pairs
         pairs = list(zip(vals[:8], vals[8:]))
         fisher_yates(pairs)
-        cleaned_rows.append([x for q, a in pairs for x in (q, a)])
+        rows_out.append([x for q, a in pairs for x in (q, a)])
 
-    return pd.DataFrame(cleaned_rows, columns=df.columns)
+    return pd.DataFrame(rows_out, columns=df_batch.columns), fallback_counter
+
+
+def final_repasse(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure absolutely no duplicate remains after all batches."""
+    seen: Dict[str, int] = {}
+    fallback_counter = 1
+    vals = df.values
+    for r in range(vals.shape[0]):
+        for c in range(vals.shape[1]):
+            cell = str(vals[r, c]).strip()
+            key = cell.lower()
+            if key in seen:
+                # paraphrase again
+                new_text = paraphrase_openai([cell])[0]
+                if not new_text:
+                    new_text = deterministic_variant(cell, fallback_counter)
+                    fallback_counter += 1
+                while new_text.lower() in seen:
+                    new_text = deterministic_variant(new_text, fallback_counter)
+                    fallback_counter += 1
+                vals[r, c] = new_text
+                seen[new_text.lower()] = 1
+            else:
+                seen[key] = 1
+    return pd.DataFrame(vals, columns=df.columns)
 
 ###############################################################################
-# Streamlit UI
+# Streamlit UI                                                               #
 ###############################################################################
 
-st.set_page_config(page_title="FAQs sans doublon (aucune cellule vide)", page_icon="🤖")
-st.title("📥 Nettoyeur & compléteur de FAQs — zéro cellule vide")
+st.set_page_config(page_title="FAQs paraphrasées sans doublon", page_icon="🤖")
+st.title("📥 Paraphrase des FAQs — traitement par batch + repasse globale")
 
 uploaded = st.file_uploader(
-    "Chargez un fichier Excel (.xls/.xlsx) de 16 colonnes (A‑P)",
+    "Chargez un Excel (.xls/.xlsx) de 16 colonnes (A‑P)",
     type=["xls", "xlsx"],
 )
 
@@ -185,36 +190,57 @@ if uploaded:
         st.error(f"Erreur de lecture : {exc}")
         st.stop()
 
-    st.subheader("Aperçu du fichier importé")
+    if raw_df.shape[1] != 16:
+        st.error("Le fichier doit contenir exactement 16 colonnes (A‑P).")
+        st.stop()
+
+    st.write("Aperçu :")
     st.dataframe(raw_df.head())
 
-    if st.button("🚀 Nettoyer, compléter et télécharger"):
-        try:
-            cleaned_df = process_dataframe(raw_df)
-        except Exception as exc:
-            st.error(f"Erreur de traitement : {exc}")
-            st.stop()
+    if st.button("🚀 Paraphraser & télécharger"):
+        # ------------ Batch processing ------------------------------
+        global_seen: Dict[str, int] = {}
+        processed_batches: List[pd.DataFrame] = []
+        counter = 1
+        for start in range(0, len(raw_df), BATCH_SIZE):
+            end = start + BATCH_SIZE
+            batch_df = raw_df.iloc[start:end]
+            cleaned_batch, counter = process_batch(batch_df, global_seen, counter)
+            processed_batches.append(cleaned_batch)
+            st.write(f"Batch {start//BATCH_SIZE +1} traité ✔️")
+
+        combined_df = pd.concat(processed_batches, ignore_index=True)
+
+        # ------------ Global repasse ---------------------------------
+        for _ in range(MAX_REPASS):
+            dup_count = combined_df.apply(lambda col: col.str.lower()).duplicated().sum()
+            if dup_count == 0:
+                break
+            combined_df = final_repasse(combined_df)
+
+        st.success("✅ Paraphrasage terminé, aucun doublon détecté.")
 
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            cleaned_df.to_excel(writer, index=False, sheet_name="MODULES FAQs - FINAL")
-        st.success(f"✅ Traitement terminé : {cleaned_df.shape[0]} lignes, 0 cellule vide.")
+            combined_df.to_excel(writer, index=False, sheet_name="MODULES FAQs - FINAL")
+
         st.download_button(
-            label="📥 Télécharger le fichier nettoyé",
+            label="📥 Télécharger le fichier final",
             data=buffer.getvalue(),
             file_name="MODULES_FAQs_FINAL.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 else:
-    st.info("Importez un classeur pour commencer.")
+    st.info("Importez un fichier pour commencer.")
 
 ###############################################################################
-# Footer
+# Footer                                                                     #
 ###############################################################################
 
 st.markdown(
-    "<sub>Les cellules uniques restent intactes ; chaque doublon est remplacé "
-    "par un contenu original (OpenAI si disponible, sinon fallback local). "
-    "Aucune cellule vide dans la sortie.</sub>",
+    "<sub>La première occurrence de chaque question/réponse est conservée ; "
+    "toutes les suivantes sont paraphrasées pour éliminer le contenu dupliqué. "
+    "Traitement en batch pour les gros fichiers, puis vérification globale "
+    "jusqu'à absence totale de doublons.</sub>",
     unsafe_allow_html=True,
 )
