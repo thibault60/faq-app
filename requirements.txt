@@ -1,7 +1,4 @@
-# requirements.txt
 streamlit>=1.35
-openai>=1.13
 pandas>=2.3
 openpyxl>=3.1
-gspread>=6.1
-oauth2client>=4.1
+openai>=1.13        # optionnel : uniquement si vous utilisez l'API
