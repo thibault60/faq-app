@@ -1,22 +1,19 @@
 """
-Streamlit app · XLS in ➜ XLS out (paraphrase duplicates, enforce Q / A format)
------------------------------------------------------------------------------
-* **Input** : Excel 16 colonnes (A‑H = Q1…Q8, I‑P = A1…A8).
-* **Rules**
-  1. The **first occurrence** of any string is preserved.
-  2. Any duplicate is paraphrased (same meaning, different wording).
-  3. **Columns whose header starts with “Q”** must contain **questions**
-     (text ending by “?”). If a cell in a Q‑column is not a question, we
-     rewrite it into interrogative form.
-  4. **Columns whose header starts with “A”** must contain **answers**
-     (no trailing “?”). If a cell in an A‑column looks like a question, we
-     rewrite it into declarative form.
-  5. Processing in batches (`BATCH_SIZE`) for large files then **global
-     repasse** until zero duplicates.
-  6. Optionally calls OpenAI for paraphrase; otherwise a deterministic fallback
-     (`variante #`).
-* Output: XLSX ready to download, with **no duplicate content, no blanks, Q/A
-  format enforced.**
+Streamlit app · XLS in ➜ XLS out (A‑H = questions, I‑P = answers)
+-----------------------------------------------------------------
+* **Input** : Excel de 16 colonnes — **A → H** contiennent exclusivement des
+  **questions**, **I → P** les **réponses associées**.
+* **Règles**
+  1. La **première occurrence** d’une question ou d’une réponse est préservée.
+  2. Toute répétition exacte est **paraphrasée** (même sens, tournure différente).
+  3. Les colonnes A‑H sont forcées à se terminer par « ? » ; les colonnes I‑P
+     n’en contiennent pas.
+  4. Traitement en **batch** (`BATCH_SIZE`) puis **repassage global** pour
+     garantir zéro doublon questions OU réponses.
+  5. Paraphrase via **OpenAI** si clé fournie ; sinon fallback déterministe
+     `(variante #)`.
+  6. Aucune cellule vide dans le fichier final.
+* **Sortie** : un XLSX téléchargeable, format et unicité respectés.
 """
 
 from __future__ import annotations
@@ -42,8 +39,8 @@ except ModuleNotFoundError:
     openai = None  # type: ignore
     OPENAI_KEY = ""
 
-BATCH_SIZE = 250  # rows par batch
-MAX_REPASS = 3    # max global passes to eliminate duplicates
+BATCH_SIZE = 250  # lignes par batch
+MAX_REPASS = 3    # boucles globales maxi
 
 ###############################################################################
 # Helper functions                                                           #
@@ -61,8 +58,8 @@ def paraphrase_openai(texts: List[str]) -> List[str]:
         return ["" for _ in texts]
 
     system_msg = (
-        "Tu es un assistant de reformulation. Réponds UNIQUEMENT par un tableau JSON contenant les reformulations, "
-        "même ordre que l'entrée, sans dépasser 150 caractères chacun."
+        "Tu es un assistant de reformulation. Réponds UNIQUEMENT par un tableau JSON, "
+        "même ordre que l'entrée, sens conservé, ≤150 caractères chacun."
     )
     user_prompt = "\n".join(texts)
 
@@ -84,99 +81,93 @@ def paraphrase_openai(texts: List[str]) -> List[str]:
     return ["" for _ in texts]
 
 
-def deterministic_variant(base: str, suffix: int, is_question: bool) -> str:
-    variant = f"{base} (variante {suffix})" if base else f"Contenu généré {suffix}"
-    return ensure_question_format(variant) if is_question else ensure_answer_format(variant)
-
-
-def ensure_question_format(text: str) -> str:
+def ensure_question(text: str) -> str:
     text = text.strip()
     if text.endswith("?"):
         return text
-    # If statement‑like, convert simply by appending '?'
-    return text.rstrip(".") + " ?"
+    return text.rstrip(".") + " ?"
 
 
-def ensure_answer_format(text: str) -> str:
+def ensure_answer(text: str) -> str:
     text = text.strip()
     if text.endswith("?"):
-        # naive conversion → remove '?' and add '.'
         text = text.rstrip("?") + "."
     if not re.search(r"[.!?]$", text):
         text += "."
     return text
 
+
+def deterministic_variant(base: str, suffix: int, as_question: bool) -> str:
+    variant = f"{base} (variante {suffix})" if base else f"Contenu généré {suffix}"
+    return ensure_question(variant) if as_question else ensure_answer(variant)
+
 ###############################################################################
 # Batch Processing                                                           #
 ###############################################################################
 
-def process_batch(df_batch: pd.DataFrame, global_seen: Dict[str, int], counter_start: int) -> Tuple[pd.DataFrame, int]:
-    rows_out: List[List[str]] = []
-    fallback_counter = counter_start
+def process_batch(df_batch: pd.DataFrame, seen: Dict[str, int], counter: int) -> Tuple[pd.DataFrame, int]:
+    out_rows: List[List[str]] = []
 
-    # Identify Q vs A column indices from headers
-    q_cols = [i for i, h in enumerate(df_batch.columns) if str(h).strip().upper().startswith("Q")]
-    a_cols = [i for i, h in enumerate(df_batch.columns) if str(h).strip().upper().startswith("A")]
+    q_cols = list(range(8))      # A‑H
+    a_cols = list(range(8, 16))  # I‑P
 
     for _, row in df_batch.iterrows():
         vals = ["" if pd.isna(v) else str(v).strip() for v in row.tolist()]
-        dup_idx, dup_texts = [], []
+        d_idx, d_texts = [], []
 
-        # Mark duplicates beyond first appearance
-        for idx, txt in enumerate(vals):
+        # Mark duplicates (global)
+        for i, txt in enumerate(vals):
             if not txt:
                 continue
             key = txt.lower()
-            if key in global_seen:
-                dup_idx.append(idx)
-                dup_texts.append(txt)
+            if key in seen:
+                d_idx.append(i)
+                d_texts.append(txt)
             else:
-                global_seen[key] = 1
+                seen[key] = 1
 
         # Paraphrase duplicates
-        if dup_idx:
-            new_texts = paraphrase_openai(dup_texts)
-            for i, new_t in zip(dup_idx, new_texts):
-                is_q = i in q_cols
+        if d_idx:
+            new_texts = paraphrase_openai(d_texts)
+            for i, new_t in zip(d_idx, new_texts):
+                as_q = i in q_cols
                 if not new_t:
-                    new_t = deterministic_variant(dup_texts[dup_idx.index(i)], fallback_counter, is_q)
-                    fallback_counter += 1
-                new_t = ensure_question_format(new_t) if is_q else ensure_answer_format(new_t)
-                while new_t.lower() in global_seen:
-                    new_t = deterministic_variant(new_t, fallback_counter, is_q)
-                    fallback_counter += 1
+                    new_t = deterministic_variant(d_texts[d_idx.index(i)], counter, as_q)
+                    counter += 1
+                new_t = ensure_question(new_t) if as_q else ensure_answer(new_t)
+                while new_t.lower() in seen:
+                    new_t = deterministic_variant(new_t, counter, as_q)
+                    counter += 1
                 vals[i] = new_t
-                global_seen[new_t.lower()] = 1
+                seen[new_t.lower()] = 1
 
-        # Fill blanks + enforce Q/A format
-        for idx, txt in enumerate(vals):
-            col_is_q = idx in q_cols
+        # Fill blanks + enforce format
+        for i, txt in enumerate(vals):
+            as_q = i in q_cols
             if not txt:
-                txt = deterministic_variant("Cellule vide", fallback_counter, col_is_q)
-                fallback_counter += 1
-            # enforce format
-            txt = ensure_question_format(txt) if col_is_q else ensure_answer_format(txt)
-            # guarantee final uniqueness
-            while txt.lower() in global_seen:
-                txt = deterministic_variant(txt, fallback_counter, col_is_q)
-                fallback_counter += 1
-            vals[idx] = txt
-            global_seen[txt.lower()] = 1
+                txt = deterministic_variant("Cellule vide", counter, as_q)
+                counter += 1
+            txt = ensure_question(txt) if as_q else ensure_answer(txt)
+            while txt.lower() in seen:
+                txt = deterministic_variant(txt, counter, as_q)
+                counter += 1
+            vals[i] = txt
+            seen[txt.lower()] = 1
 
-        # Shuffle pairs
+        # Shuffle pairs to casser l'ordre si besoin
         pairs = list(zip(vals[:8], vals[8:]))
         fisher_yates(pairs)
-        rows_out.append([x for q, a in pairs for x in (q, a)])
+        out_rows.append([x for q, a in pairs for x in (q, a)])
 
-    return pd.DataFrame(rows_out, columns=df_batch.columns), fallback_counter
+    return pd.DataFrame(out_rows, columns=df_batch.columns), counter
 
 ###############################################################################
 # Global Repasse                                                             #
 ###############################################################################
 
 def global_repasse(df: pd.DataFrame) -> pd.DataFrame:
-    q_cols = [i for i, h in enumerate(df.columns) if str(h).strip().upper().startswith("Q")]
-    a_cols = [i for i, h in enumerate(df.columns) if str(h).strip().upper().startswith("A")]
+    q_cols = list(range(8))
+    a_cols = list(range(8, 16))
 
     seen: Dict[str, int] = {}
     counter = 1
@@ -186,32 +177,32 @@ def global_repasse(df: pd.DataFrame) -> pd.DataFrame:
         for c in range(values.shape[1]):
             cell = str(values[r, c]).strip()
             is_q = c in q_cols
-            formatted = ensure_question_format(cell) if is_q else ensure_answer_format(cell)
-            cell_key = formatted.lower()
-            if cell_key in seen:
-                new_t = paraphrase_openai([formatted])[0]
+            cell = ensure_question(cell) if is_q else ensure_answer(cell)
+            key = cell.lower()
+            if key in seen:
+                new_t = paraphrase_openai([cell])[0]
                 if not new_t:
-                    new_t = deterministic_variant(formatted, counter, is_q)
+                    new_t = deterministic_variant(cell, counter, is_q)
                     counter += 1
-                new_t = ensure_question_format(new_t) if is_q else ensure_answer_format(new_t)
+                new_t = ensure_question(new_t) if is_q else ensure_answer(new_t)
                 while new_t.lower() in seen:
                     new_t = deterministic_variant(new_t, counter, is_q)
                     counter += 1
                 values[r, c] = new_t
                 seen[new_t.lower()] = 1
             else:
-                seen[cell_key] = 1
-                values[r, c] = formatted
+                seen[key] = 1
+                values[r, c] = cell
     return pd.DataFrame(values, columns=df.columns)
 
 ###############################################################################
 # Streamlit UI                                                               #
 ###############################################################################
 
-st.set_page_config(page_title="FAQs uniques (règle Q/A)", page_icon="🤖")
-st.title("📥 Nettoyeur & Paraphrase — Q-columns = questions, A-columns = réponses")
+st.set_page_config(page_title="FAQs uniques (A‑H Q / I‑P A)", page_icon="🤖")
+st.title("📥 Nettoyeur Q/A — A‑H = questions, I‑P = réponses")
 
-file = st.file_uploader("Sélectionnez votre Excel (16 colonnes A‑P)", type=["xls", "xlsx"])
+file = st.file_uploader("Chargez un fichier Excel 16 colonnes (A‑P)", type=["xls", "xlsx"])
 
 if file:
     try:
@@ -221,55 +212,54 @@ if file:
         st.stop()
 
     if df_in.shape[1] != 16:
-        st.error("Le fichier doit comporter exactement 16 colonnes (A‑P).")
+        st.error("Le fichier doit comporter exactement 16 colonnes (A‑P).")
         st.stop()
 
     st.write("Aperçu :")
     st.dataframe(df_in.head())
 
     if st.button("🚀 Traiter et télécharger"):
-        global_seen: Dict[str, int] = {}
+        seen: Dict[str, int] = {}
         counter = 1
-        processed_parts: List[pd.DataFrame] = []
+        parts: List[pd.DataFrame] = []
 
         for start in range(0, len(df_in), BATCH_SIZE):
             part = df_in.iloc[start:start + BATCH_SIZE]
-            cleaned_part, counter = process_batch(part, global_seen, counter)
-            processed_parts.append(cleaned_part)
+            cleaned, counter = process_batch(part, seen, counter)
+            parts.append(cleaned)
             st.write(f"Batch {(start // BATCH_SIZE) + 1} terminé ✔️")
 
-        combined_df = pd.concat(processed_parts, ignore_index=True)
+        combined = pd.concat(parts, ignore_index=True)
 
-        # repasse globale pour assurance
+        # passes globales anti‑doublon
         for _ in range(MAX_REPASS):
-            before = combined_df.apply(lambda col: col.str.lower()).duplicated().sum()
-            combined_df = global_repasse(combined_df)
-            after = combined_df.apply(lambda col: col.str.lower()).duplicated().sum()
+            before = combined.apply(lambda col: col.str.lower()).duplicated().sum()
+            combined = global_repasse(combined)
+            after = combined.apply(lambda col: col.str.lower()).duplicated().sum()
             if after == 0 or after == before:
                 break
 
-        st.success("✅ Fichier prêt, plus aucun doublon et format Q/A respecté.")
+        st.success("✅ Fichier prêt : questions en A‑H, réponses en I‑P, aucun doublon.")
 
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            combined_df.to_excel(writer, index=False, sheet_name="MODULES FAQs - FINAL")
+            combined.to_excel(writer, index=False, sheet_name="MODULES FAQs - FINAL")
         st.download_button(
-            "📥 Télécharger le fichier final",
+            "📥 Télécharger le XLSX final",
             data=buf.getvalue(),
             file_name="MODULES_FAQs_FINAL.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 else:
-    st.info("Veuillez charger un fichier Excel pour démarrer.")
+    st.info("Téléversez un fichier Excel pour commencer.")
 
 ###############################################################################
 # Footer                                                                     #
 ###############################################################################
 
 st.markdown(
-    "<sub>Les colonnes dont l'en‑tête commence par 'Q' sont forcées à finir par un point d'interrogation. "
-    "Celles commençant par 'A' sont reformulées sans point d'interrogation. "
-    "La première occurrence est préservée, toutes les suivantes paraphrasées. "
-    "Aucune cellule blanche ni doublon.</sub>",
+    "<sub>Les 8 premières colonnes sont contraintes à finir par un point d'interrogation, "
+    "les 8 suivantes à ne pas en contenir. Unicité totale des questions et des réponses, "
+    "avec paraphrase automatique le cas échéant.</sub>",
     unsafe_allow_html=True,
 )
