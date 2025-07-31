@@ -250,4 +250,23 @@ if file:
 
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            combined.to_excel(writer, index
+            combined.to_excel(writer, index=False, sheet_name="MODULES FAQs - FINAL")
+
+        st.download_button(
+            "📥 Télécharger le fichier XLSX final",
+            data=buf.getvalue(),
+            file_name="MODULES_FAQs_FINAL.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+else:
+    st.info("Chargez un fichier pour commencer.")
+
+###############################################################################
+# Footer                                                                     #
+###############################################################################
+
+st.markdown(
+    "<sub>Deux repasses complètes garantissent l'absence totale de doublons et la conformité Q/A. "
+    "Les suffixes linguistiques (bis, ter, ...) ne sont utilisés qu'en dernier recours.</sub>",
+    unsafe_allow_html=True,
+)
