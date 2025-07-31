@@ -40,6 +40,7 @@ except ModuleNotFoundError:
 
 BATCH_SIZE = 10  # traitement par lots de 10 lignes
 GLOBAL_REPASSES = 2  # consolidation qualité
+PARA_CHUNK = 180     # max 180 cellules par requête OpenAI
 
 ###############################################################################
 # Helpers                                                                     #
@@ -77,7 +78,7 @@ def paraphrase_openai(texts: List[str], is_question: List[bool]) -> List[str]:
     try:
         resp = openai.chat.completions.create(
             model="gpt-4o",  # version complète pour qualité
-            temperature=0.4,
+            temperature=0.7,
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
@@ -175,36 +176,47 @@ def process_batch(batch: pd.DataFrame, seen: Dict[str, int], idx_counter: int) -
 ###############################################################################
 
 def global_repasse(df: pd.DataFrame) -> pd.DataFrame:
+    """Second-pass paraphrase in chunks to avoid token overflow."""
     q_cols = list(range(8))
     a_cols = list(range(8, 16))
     seen: Dict[str, int] = {}
     idx_counter = 1
 
-    all_texts, q_flags = [], []
-    for text, col in zip(df.values.flatten().tolist(), [c for _ in range(df.shape[0]) for c in range(16)]):
-        all_texts.append(str(text).strip())
-        q_flags.append(col in q_cols)
+    # Flatten with flags
+    flat_texts, flags = [], []
+    for r in range(df.shape[0]):
+        for c in range(16):
+            t = str(df.iat[r, c]).strip()
+            flat_texts.append(t)
+            flags.append(c in q_cols)
 
-    refined = paraphrase_openai(all_texts, q_flags)
-    if not any(refined):
-        # OpenAI down → return original df (already unique)
-        return df
+    # Paraphrase by chunks to respect rate limits
+    refined: List[str] = []
+    for start in range(0, len(flat_texts), PARA_CHUNK):
+        chunk = flat_texts[start:start+PARA_CHUNK]
+        chunk_flags = flags[start:start+PARA_CHUNK]
+        refined.extend(paraphrase_openai(chunk, chunk_flags))
 
-    reshaped = [refined[i:i+16] for i in range(0, len(refined), 16)]
+    if not refined or len(refined) != len(flat_texts):
+        return df  # fallback: keep original
+
+    # Rebuild DataFrame with uniqueness enforcement
     clean_rows = []
+    ptr = 0
     local_seen: Dict[str, int] = {}
-    for row in reshaped:
-        fixed_row = []
-        for col_idx, cell in enumerate(row):
-            is_q = col_idx in q_cols
+    for r in range(df.shape[0]):
+        new_row = []
+        for c in range(16):
+            cell = refined[ptr].strip()
+            ptr += 1
+            is_q = c in q_cols
             cell = ensure_question(cell) if is_q else ensure_answer(cell)
-            # enforce uniqueness again
             if cell.lower() in local_seen:
                 cell = fallback_variant(cell, idx_counter, is_q)
                 idx_counter += 1
             local_seen[cell.lower()] = 1
-            fixed_row.append(cell)
-        clean_rows.append(fixed_row)
+            new_row.append(cell)
+        clean_rows.append(new_row)
 
     return pd.DataFrame(clean_rows, columns=df.columns)
 
