@@ -1,19 +1,19 @@
 """
-Streamlit app · XLS in ➜ XLS out (A-H = questions, I-P = answers)
-------------------------------------------------------------------
-* **Input** : fichier Excel 16 colonnes — **A→H** contiennent des **questions**,
-  **I→P** les **réponses correspondantes**.
-* **Contraintes**
-  1. On conserve la **première apparition** d’une question ou d’une réponse.
-  2. Tout doublon exact est **paraphrasé** (même sens, autre formulation).
-  3. Colonnes A-H → toujours se terminer par « ? » ; colonnes I-P → jamais de « ? ».
-  4. Traitement par **lots de 10 lignes** (mémoire maîtrisée) puis **deux
-     repasses globales** : ChatGPT re-vérifie et paraphrase encore si besoin.
-  5. Paraphrase via **OpenAI** si clé présente ; sinon un fallback ajoute un mot
-     clé (« bis », « ter », …) pour garantir l’unicité ― **sans** la mention
-     “(variante X)”.
-  6. Aucune cellule vide en sortie.
-* **Sortie** : fichier XLSX téléchargeable, conforme et sans répétitions.
+Streamlit App · XLS in ➜ XLS out (quality-first Q/A enforcement)
+-----------------------------------------------------------------
+* **Input** : Excel 16 colonnes — **A-H** doivent contenir des **questions** (terminées par "?"), **I-P** les **réponses associées** (sans "?").
+* **Règles**
+  1. La **première apparition** d’une question ou d’une réponse est conservée.
+  2. Toute répétition exacte est **paraphrasée** avec ChatGPT (modèle GPT-4o) ;
+     on privilégie la **qualité** à la vitesse (température 0.4, modèle complet).
+  3. Si une cellule d’une colonne Q n’est pas une vraie question, ChatGPT la
+     convertit en **question pertinente** ; l’inverse pour une réponse.
+  4. Traitement **par lots de 10 lignes** puis **2 repasses globales** — chaque
+     repasse renvoie la liste complète à ChatGPT pour validation & correction
+     finale.
+  5. En absence de clé OpenAI, un fallback ajoute un suffixe linguistique (" bis", " ter", …) pour garantir l’unicité (sans “(variante X)”).
+  6. Zéro cellule vide en sortie.
+* **Sortie** : un fichier XLSX téléchargeable (« MODULES FAQs - FINAL »), 0 doublon & conformité Q/A.
 """
 
 from __future__ import annotations
@@ -26,9 +26,9 @@ from typing import List, Tuple, Dict
 import pandas as pd
 import streamlit as st
 
-# ---------------------------------------------------------------------------
-# OpenAI (optionnel)                                                         #
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
+# OpenAI (optionnel)                                                          
+# ────────────────────────────────────────────────────────────────────────────
 try:
     import openai  # type: ignore
     OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", "")
@@ -39,7 +39,7 @@ except ModuleNotFoundError:
     OPENAI_KEY = ""
 
 BATCH_SIZE = 10  # traitement par lots de 10 lignes
-MAX_REPASS = 2   # toujours 2 repasses globales
+GLOBAL_REPASSES = 2  # consolidation qualité
 
 ###############################################################################
 # Helpers                                                                     #
@@ -52,25 +52,36 @@ def fisher_yates(arr: List[Tuple[str, str]]):
         arr[i], arr[j] = arr[j], arr[i]
 
 
-def paraphrase_openai(texts: List[str]) -> List[str]:
-    """Paraphrase via OpenAI ou renvoie une liste vide en cas d’indisponibilité."""
+# ──────────────── Paraphrase / Correction via OpenAI ────────────────────────
+
+def paraphrase_openai(texts: List[str], is_question: List[bool]) -> List[str]:
+    """Paraphrase en respectant Q/A : liste in  = liste out (même ordre)."""
     if not OPENAI_KEY or not openai or not texts:
         return ["" for _ in texts]
 
+    # Marque chaque entrée pour indiquer à ChatGPT de produire question ou réponse
+    formatted = [
+        ("Question : " if q else "Réponse : ") + t for t, q in zip(texts, is_question)
+    ]
+
     system_msg = (
-        "Tu es un assistant de reformulation. Réponds UNIQUEMENT par un tableau JSON, "
-        "même ordre, sens conservé, max 150 caractères chacun."
+        "Tu es un assistant expert en reformulation de FAQ. "
+        "Pour chaque élément fourni, renvoie UNIQUEMENT un tableau JSON contenant les "
+        "mêmes éléments reformulés, ordre identique. \n"
+        "• Si l'élément commence par 'Question :', assure-toi qu'il s'agit bien d'une question claire, concise, terminée par '?' (max 150 car.).\n"
+        "• Si l'élément commence par 'Réponse :', produis une réponse déclarative, sans '?' final (max 150 car.).\n"
+        "Préserve le sens, varie la formulation, évite tout doublon littéral avec les autres éléments."
     )
-    user_msg = "\n".join(texts)
+    user_msg = "\n".join(formatted)
 
     try:
         resp = openai.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",  # version complète pour qualité
+            temperature=0.4,
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
-            temperature=0.7,
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content)
@@ -80,6 +91,8 @@ def paraphrase_openai(texts: List[str]) -> List[str]:
         st.warning(f"OpenAI error : {e}")
     return ["" for _ in texts]
 
+
+# ─────────────── Enforcement helpers ───────────────────────────────────────
 
 def ensure_question(text: str) -> str:
     text = text.strip()
@@ -95,162 +108,146 @@ def ensure_answer(text: str) -> str:
     return text
 
 
-def deterministic_variant(base: str, idx: int, as_question: bool) -> str:
-    """Fallback unique sans le motif (variante X)."""
+def fallback_variant(base: str, idx: int, as_question: bool) -> str:
     markers = [" bis", " ter", " quater", " quinquies", " sexies", " septies", " octies"]
     suffix = markers[idx % len(markers)] if base else f" duplicat {idx}"
     variant = f"{base.rstrip('? .')}{suffix}" if base else suffix.strip()
     return ensure_question(variant) if as_question else ensure_answer(variant)
 
 ###############################################################################
-# Lot de traitement                                                           #
+# Batch processing (10 lines)                                                 #
 ###############################################################################
 
-def process_batch(df_batch: pd.DataFrame, seen: Dict[str, int], counter: int) -> Tuple[pd.DataFrame, int]:
-    rows_out: List[List[str]] = []
+def process_batch(batch: pd.DataFrame, seen: Dict[str, int], idx_counter: int) -> Tuple[pd.DataFrame, int]:
     q_cols = list(range(8))
     a_cols = list(range(8, 16))
+    out_rows: List[List[str]] = []
 
-    for _, row in df_batch.iterrows():
+    for _, row in batch.iterrows():
         vals = ["" if pd.isna(v) else str(v).strip() for v in row.tolist()]
-        dup_idx, dup_texts = [], []
+        dup_i, dup_t, dup_qflag = [], [], []
 
-        # marquer les duplicatas globaux
         for i, txt in enumerate(vals):
             if not txt:
                 continue
             if txt.lower() in seen:
-                dup_idx.append(i)
-                dup_texts.append(txt)
+                dup_i.append(i)
+                dup_t.append(txt)
+                dup_qflag.append(i in q_cols)
             else:
                 seen[txt.lower()] = 1
 
-        # paraphrase des duplicatas
-        if dup_idx:
-            new_texts = paraphrase_openai(dup_texts)
-            for i, new_t in zip(dup_idx, new_texts):
-                is_q = i in q_cols
+        # Paraphrase duplicates en bloc
+        if dup_i:
+            new_texts = paraphrase_openai(dup_t, dup_qflag)
+            for pos, new_t, is_q in zip(dup_i, new_texts, dup_qflag):
                 if not new_t:
-                    new_t = deterministic_variant(dup_texts[dup_idx.index(i)], counter, is_q)
-                    counter += 1
+                    new_t = fallback_variant(dup_t[dup_i.index(pos)], idx_counter, is_q)
+                    idx_counter += 1
                 new_t = ensure_question(new_t) if is_q else ensure_answer(new_t)
                 while new_t.lower() in seen:
-                    new_t = deterministic_variant(new_t, counter, is_q)
-                    counter += 1
-                vals[i] = new_t
+                    new_t = fallback_variant(new_t, idx_counter, is_q)
+                    idx_counter += 1
+                vals[pos] = new_t
                 seen[new_t.lower()] = 1
 
-        # remplissage des vides + enforcement Q/A
+        # Blanks & formatting
         for i, txt in enumerate(vals):
             is_q = i in q_cols
             if not txt:
-                txt = deterministic_variant("Contenu manquant", counter, is_q)
-                counter += 1
+                txt = fallback_variant("Contenu manquant", idx_counter, is_q)
+                idx_counter += 1
             txt = ensure_question(txt) if is_q else ensure_answer(txt)
             while txt.lower() in seen:
-                txt = deterministic_variant(txt, counter, is_q)
-                counter += 1
+                txt = fallback_variant(txt, idx_counter, is_q)
+                idx_counter += 1
             vals[i] = txt
             seen[txt.lower()] = 1
 
         pairs = list(zip(vals[:8], vals[8:]))
         fisher_yates(pairs)
-        rows_out.append([x for q, a in pairs for x in (q, a)])
+        out_rows.append([x for q, a in pairs for x in (q, a)])
 
-    return pd.DataFrame(rows_out, columns=df_batch.columns), counter
+    return pd.DataFrame(out_rows, columns=batch.columns), idx_counter
 
 ###############################################################################
-# Repassage global (2 tours)                                                  #
+# Global repasse (2 passes qualité)                                          #
 ###############################################################################
 
 def global_repasse(df: pd.DataFrame) -> pd.DataFrame:
     q_cols = list(range(8))
     a_cols = list(range(8, 16))
     seen: Dict[str, int] = {}
-    counter = 1
-    arr = df.values
+    idx_counter = 1
 
-    for r in range(arr.shape[0]):
-        for c in range(arr.shape[1]):
-            text = str(arr[r, c]).strip()
-            is_q = c in q_cols
-            text = ensure_question(text) if is_q else ensure_answer(text)
-            key = text.lower()
-            if key in seen:
-                new_t = paraphrase_openai([text])[0]
-                if not new_t:
-                    new_t = deterministic_variant(text, counter, is_q)
-                    counter += 1
-                new_t = ensure_question(new_t) if is_q else ensure_answer(new_t)
-                while new_t.lower() in seen:
-                    new_t = deterministic_variant(new_t, counter, is_q)
-                    counter += 1
-                arr[r, c] = new_t
-                seen[new_t.lower()] = 1
-            else:
-                seen[key] = 1
-                arr[r, c] = text
-    return pd.DataFrame(arr, columns=df.columns)
+    all_texts, q_flags = [], []
+    for text, col in zip(df.values.flatten().tolist(), [c for _ in range(df.shape[0]) for c in range(16)]):
+        all_texts.append(str(text).strip())
+        q_flags.append(col in q_cols)
+
+    refined = paraphrase_openai(all_texts, q_flags)
+    if not any(refined):
+        # OpenAI down → return original df (already unique)
+        return df
+
+    reshaped = [refined[i:i+16] for i in range(0, len(refined), 16)]
+    clean_rows = []
+    local_seen: Dict[str, int] = {}
+    for row in reshaped:
+        fixed_row = []
+        for col_idx, cell in enumerate(row):
+            is_q = col_idx in q_cols
+            cell = ensure_question(cell) if is_q else ensure_answer(cell)
+            # enforce uniqueness again
+            if cell.lower() in local_seen:
+                cell = fallback_variant(cell, idx_counter, is_q)
+                idx_counter += 1
+            local_seen[cell.lower()] = 1
+            fixed_row.append(cell)
+        clean_rows.append(fixed_row)
+
+    return pd.DataFrame(clean_rows, columns=df.columns)
 
 ###############################################################################
-# Interface Streamlit                                                        #
+# Streamlit Interface                                                        #
 ###############################################################################
 
-st.set_page_config(page_title="FAQs uniques (lots de 10)", page_icon="🤖")
-st.title("📥 Nettoyeur Q/A — questions A-H · réponses I-P · lots de 10")
+st.set_page_config(page_title="FAQs Q/A — Qualité", page_icon="🤖")
+st.title("🔍 Nettoyeur & Paraphrase haute-qualité (lots de 10)")
 
-file = st.file_uploader("Téléversez votre Excel (16 colonnes A-P)", type=["xls", "xlsx"])
+file = st.file_uploader("Importez un Excel 16 colonnes (A-P)", type=["xls", "xlsx"])
 
 if file:
     try:
-        df_in = pd.read_excel(file, engine="openpyxl")
+        df = pd.read_excel(file, engine="openpyxl")
     except Exception as e:
         st.error(f"Erreur de lecture : {e}")
         st.stop()
 
-    if df_in.shape[1] != 16:
-        st.error("Le fichier doit comporter exactement 16 colonnes (A-P).")
+    if df.shape[1] != 16:
+        st.error("Le fichier doit avoir 16 colonnes (A-P).")
         st.stop()
 
-    st.dataframe(df_in.head())
+    st.dataframe(df.head())
 
-    if st.button("🚀 Traiter et télécharger"):
+    if st.button("🚀 Lancer traitement haute-qualité"):
         seen_global: Dict[str, int] = {}
         counter = 1
-        processed: List[pd.DataFrame] = []
+        parts: List[pd.DataFrame] = []
+        for start in range(0, len(df), BATCH_SIZE):
+            batch_df = df.iloc[start:start+BATCH_SIZE]
+            cleaned, counter = process_batch(batch_df, seen_global, counter)
+            parts.append(cleaned)
+            st.write(f"Batch {(start//BATCH_SIZE)+1} terminé ✔️")
 
-        for start in range(0, len(df_in), BATCH_SIZE):
-            batch = df_in.iloc[start:start + BATCH_SIZE]
-            clean_batch, counter = process_batch(batch, seen_global, counter)
-            processed.append(clean_batch)
-            st.write(f"Batch {(start // BATCH_SIZE) + 1} terminé ✔️")
+        combined = pd.concat(parts, ignore_index=True)
 
-        combined = pd.concat(processed, ignore_index=True)
-
-        # deux repasses ChatGPT pour consolidation
-        for _ in range(MAX_REPASS):
+        # Deux repasses complètes avec ChatGPT pour consolidation qualité
+        for _ in range(GLOBAL_REPASSES):
             combined = global_repasse(combined)
 
-        st.success("✅ Traitement fini : questions uniques A-H, réponses uniques I-P.")
+        st.success("✅ Fichier final prêt : aucune répétition, Q/A conforme.")
 
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            combined.to_excel(writer, index=False, sheet_name="MODULES FAQs - FINAL")
-        st.download_button(
-            "📥 Télécharger le XLSX final",
-            data=buf.getvalue(),
-            file_name="MODULES_FAQs_FINAL.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-else:
-    st.info("Chargez un fichier pour commencer.")
-
-###############################################################################
-# Footer                                                                     #
-###############################################################################
-
-st.markdown(
-    "<sub>Deux passes globales assurent l'absence totale de doublons ; les "
-    "fallbacks ajoutent ‘bis’, ‘ter’, etc., plutôt que l'ancien suffixe </sub>",
-    unsafe_allow_html=True,
-)
+            combined.to_excel(writer, index
