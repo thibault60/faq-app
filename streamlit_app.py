@@ -1,19 +1,19 @@
 """
-Streamlit App · XLS in ➜ XLS out (quality-first Q/A enforcement)
+Streamlit App · XLS in ➜ XLS out (quality‑first Q/A enforcement)
 -----------------------------------------------------------------
-* **Input** : Excel 16 colonnes — **A-H** doivent contenir des **questions** (terminées par "?"), **I-P** les **réponses associées** (sans "?").
+* **Input** : Excel 16 colonnes — **A‑H** doivent contenir des **questions** (terminées par "?"), **I‑P** les **réponses associées** (sans "?").
 * **Règles**
   1. La **première apparition** d’une question ou d’une réponse est conservée.
-  2. Toute répétition exacte est **paraphrasée** avec ChatGPT (modèle GPT-4o) ;
-     on privilégie la **qualité** à la vitesse (température 0.4, modèle complet).
+  2. Toute répétition exacte est **paraphrasée** avec ChatGPT (modèle GPT‑4o) ;
+     on privilégie la **qualité** à la vitesse (température 0.4, modèle complet).
   3. Si une cellule d’une colonne Q n’est pas une vraie question, ChatGPT la
-     convertit en **question pertinente** ; l’inverse pour une réponse.
-  4. Traitement **par lots de 10 lignes** puis **2 repasses globales** — chaque
+     convertit en **question pertinente** ; l’inverse pour une réponse.
+  4. Traitement **par lots de 10 lignes** puis **2 repasses globales** — chaque
      repasse renvoie la liste complète à ChatGPT pour validation & correction
      finale.
-  5. En absence de clé OpenAI, un fallback ajoute un suffixe linguistique (" bis", " ter", …) pour garantir l’unicité (sans “(variante X)”).
+  5. En absence de clé OpenAI, un fallback ajoute un suffixe linguistique (" bis", " ter", …) pour garantir l’unicité (sans “(variante X)”).
   6. Zéro cellule vide en sortie.
-* **Sortie** : un fichier XLSX téléchargeable (« MODULES FAQs - FINAL »), 0 doublon & conformité Q/A.
+* **Sortie** : un fichier XLSX téléchargeable (« MODULES FAQs ‑ FINAL »), 0 doublon & conformité Q/A.
 """
 
 from __future__ import annotations
@@ -55,21 +55,21 @@ def fisher_yates(arr: List[Tuple[str, str]]):
 # ──────────────── Paraphrase / Correction via OpenAI ────────────────────────
 
 def paraphrase_openai(texts: List[str], is_question: List[bool]) -> List[str]:
-    """Paraphrase en respectant Q/A : liste in  = liste out (même ordre)."""
+    """Paraphrase en respectant Q/A : liste in  = liste out (même ordre)."""
     if not OPENAI_KEY or not openai or not texts:
         return ["" for _ in texts]
 
     # Marque chaque entrée pour indiquer à ChatGPT de produire question ou réponse
     formatted = [
-        ("Question : " if q else "Réponse : ") + t for t, q in zip(texts, is_question)
+        ("Question : " if q else "Réponse : ") + t for t, q in zip(texts, is_question)
     ]
 
     system_msg = (
         "Tu es un assistant expert en reformulation de FAQ. "
         "Pour chaque élément fourni, renvoie UNIQUEMENT un tableau JSON contenant les "
         "mêmes éléments reformulés, ordre identique. \n"
-        "• Si l'élément commence par 'Question :', assure-toi qu'il s'agit bien d'une question claire, concise, terminée par '?' (max 150 car.).\n"
-        "• Si l'élément commence par 'Réponse :', produis une réponse déclarative, sans '?' final (max 150 car.).\n"
+        "• Si l'élément commence par 'Question :', assure‑toi qu'il s'agit bien d'une question claire, concise, terminée par '?' (max 150 car.).\n"
+        "• Si l'élément commence par 'Réponse :', produis une réponse déclarative, sans '?' final (max 150 car.).\n"
         "Préserve le sens, varie la formulation, évite tout doublon littéral avec les autres éléments."
     )
     user_msg = "\n".join(formatted)
@@ -88,7 +88,7 @@ def paraphrase_openai(texts: List[str], is_question: List[bool]) -> List[str]:
         if isinstance(data, list) and len(data) == len(texts):
             return [str(x).strip() for x in data]
     except Exception as e:
-        st.warning(f"OpenAI error : {e}")
+        st.warning(f"OpenAI error : {e}")
     return ["" for _ in texts]
 
 
@@ -96,7 +96,7 @@ def paraphrase_openai(texts: List[str], is_question: List[bool]) -> List[str]:
 
 def ensure_question(text: str) -> str:
     text = text.strip()
-    return text if text.endswith("?") else text.rstrip(". ") + " ?"
+    return text if text.endswith("?") else text.rstrip(". ") + " ?"
 
 
 def ensure_answer(text: str) -> str:
@@ -110,7 +110,7 @@ def ensure_answer(text: str) -> str:
 
 def fallback_variant(base: str, idx: int, as_question: bool) -> str:
     markers = [" bis", " ter", " quater", " quinquies", " sexies", " septies", " octies"]
-    suffix = markers[idx % len(markers)] if base else f" duplicat {idx}"
+    suffix = markers[idx % len(markers)] if base else f" duplicat {idx}"
     variant = f"{base.rstrip('? .')}{suffix}" if base else suffix.strip()
     return ensure_question(variant) if as_question else ensure_answer(variant)
 
@@ -213,24 +213,24 @@ def global_repasse(df: pd.DataFrame) -> pd.DataFrame:
 ###############################################################################
 
 st.set_page_config(page_title="FAQs Q/A — Qualité", page_icon="🤖")
-st.title("🔍 Nettoyeur & Paraphrase haute-qualité (lots de 10)")
+st.title("🔍 Nettoyeur & Paraphrase haute‑qualité (lots de 10)")
 
-file = st.file_uploader("Importez un Excel 16 colonnes (A-P)", type=["xls", "xlsx"])
+file = st.file_uploader("Importez un Excel 16 colonnes (A‑P)", type=["xls", "xlsx"])
 
 if file:
     try:
         df = pd.read_excel(file, engine="openpyxl")
     except Exception as e:
-        st.error(f"Erreur de lecture : {e}")
+        st.error(f"Erreur de lecture : {e}")
         st.stop()
 
     if df.shape[1] != 16:
-        st.error("Le fichier doit avoir 16 colonnes (A-P).")
+        st.error("Le fichier doit avoir 16 colonnes (A‑P).")
         st.stop()
 
     st.dataframe(df.head())
 
-    if st.button("🚀 Lancer traitement haute-qualité"):
+    if st.button("🚀 Lancer traitement haute‑qualité"):
         seen_global: Dict[str, int] = {}
         counter = 1
         parts: List[pd.DataFrame] = []
@@ -246,7 +246,7 @@ if file:
         for _ in range(GLOBAL_REPASSES):
             combined = global_repasse(combined)
 
-        st.success("✅ Fichier final prêt : aucune répétition, Q/A conforme.")
+        st.success("✅ Fichier final prêt : aucune répétition, Q/A conforme.")
 
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
